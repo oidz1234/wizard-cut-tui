@@ -486,6 +486,50 @@ class SaveWatcher(threading.Thread):
         self.running = False
 
 
+class StatusUpdater(threading.Thread):
+    """Polls mpv state and writes status info for vim's statusline."""
+    def __init__(self, status_file: str, mpv: MpvPreviewController,
+                 save_watcher, poll_interval: float = 0.5):
+        super().__init__(daemon=True)
+        self.status_file = status_file
+        self.mpv = mpv
+        self.save_watcher = save_watcher
+        self.poll_interval = poll_interval
+        self.running = True
+
+    def run(self):
+        while self.running:
+            try:
+                paused = self.mpv.is_paused()
+                time_pos = self.mpv.get_time_pos()
+                duration = self.mpv.get_property("duration")
+
+                state = "paused" if paused else "playing" if paused is False else "?"
+                t = self._fmt(time_pos) if time_pos is not None else "0:00"
+                d = self._fmt(duration) if duration is not None else "0:00"
+
+                cuts = 0
+                if self.save_watcher and self.save_watcher.current_keep_segments is not None:
+                    # Number of gaps = number of cut regions
+                    ks = self.save_watcher.current_keep_segments
+                    cuts = max(0, len(ks) - 1) if ks else 0
+
+                with open(self.status_file, 'w') as f:
+                    f.write(f"{state},{t},{d},{cuts}")
+            except Exception:
+                pass
+            time.sleep(self.poll_interval)
+
+    @staticmethod
+    def _fmt(seconds):
+        m = int(seconds // 60)
+        s = int(seconds % 60)
+        return f"{m}:{s:02d}"
+
+    def stop(self):
+        self.running = False
+
+
 class CommandDispatcher(threading.Thread):
     """Reads commands from vim via a file and dispatches to mpv."""
     def __init__(self, cmd_file: str, mpv: MpvPreviewController, poll_interval: float = 0.05):
@@ -848,7 +892,26 @@ class WizardCutEditor:
             f.write("  call timer_start(50, {-> execute('let s:following_playback = 0')})\n")
             f.write("endfunction\n\n")
             f.write("let s:playback_timer = timer_start(50, function('s:CheckPlaybackTarget'), {'repeat': -1})\n")
-            f.write("autocmd VimLeave * call timer_stop(s:playback_timer)\n")
+            f.write("autocmd VimLeave * call timer_stop(s:playback_timer)\n\n")
+            # Statusline
+            f.write("function! WizardCutStatus()\n")
+            f.write("  if !filereadable(s:status_file) | return 'WizardCut' | endif\n")
+            f.write("  let l:content = readfile(s:status_file)\n")
+            f.write("  if empty(l:content) | return 'WizardCut' | endif\n")
+            f.write("  let l:p = split(l:content[0], ',')\n")
+            f.write("  if len(l:p) < 4 | return 'WizardCut' | endif\n")
+            f.write("  let l:icon = l:p[0] == 'playing' ? '>' : '||'\n")
+            f.write("  let l:cuts = l:p[3] == '0' ? '' : ' | [' . l:p[3] . ' cuts]'\n")
+            f.write("  return 'WizardCut ' . l:icon . ' ' . l:p[1] . ' / ' . l:p[2] . l:cuts\n")
+            f.write("endfunction\n")
+            f.write("set statusline=%{WizardCutStatus()}%=%m\\ %l,%c\n")
+            f.write("set laststatus=2\n\n")
+            # Refresh statusline periodically
+            f.write("function! s:RefreshStatus(timer_id)\n")
+            f.write("  redrawstatus\n")
+            f.write("endfunction\n")
+            f.write("let s:status_timer = timer_start(500, function('s:RefreshStatus'), {'repeat': -1})\n")
+            f.write("autocmd VimLeave * call timer_stop(s:status_timer)\n")
         return script_path
 
     def open_in_editor(self) -> bool:
@@ -913,6 +976,7 @@ class WizardCutEditor:
         )
 
         cmd_dispatch = CommandDispatcher(cmd_file, mpv)
+        status_updater = StatusUpdater(status_file, mpv, save_watch)
 
         # Wire cross-references
         watcher.follower = follower
@@ -923,6 +987,7 @@ class WizardCutEditor:
         follower.start()
         save_watch.start()
         cmd_dispatch.start()
+        status_updater.start()
 
         try:
             editor_base = os.path.basename(editor)
@@ -940,6 +1005,7 @@ class WizardCutEditor:
             console.print(f"[red]Error opening editor: {e}[/red]")
             return False
         finally:
+            status_updater.stop()
             cmd_dispatch.stop()
             watcher.stop()
             follower.stop()
