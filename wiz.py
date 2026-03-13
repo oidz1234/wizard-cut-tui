@@ -66,6 +66,124 @@ class CutRegion:
     def __str__(self) -> str:
         return f"{format_time(self.start_time)} - {format_time(self.end_time)}: {self.text}"
 
+# --- Standalone functions for reuse by preview threads ---
+
+def compute_deleted_segment_ids(original_content: str, edited_content: str,
+                                transcript_segments: list) -> Set[int]:
+    """Diff original vs edited transcript content and return indices of deleted segments."""
+    orig_lines = [line for line in original_content.split('\n') if not line.startswith('#')]
+    edited_lines = [line for line in edited_content.split('\n') if not line.startswith('#')]
+    orig_text = '\n'.join(orig_lines)
+    edited_text = '\n'.join(edited_lines)
+
+    def tokenize(text):
+        silence_pattern = r'(\[SILENCE-\d+ \d+\.\d+s\])'
+        protected = re.sub(silence_pattern, lambda m: m.group(0).replace(' ', '█'), text)
+        tokens = re.split(r'\s+', protected)
+        return [t.replace('█', ' ') for t in tokens if t]
+
+    orig_tokens = tokenize(orig_text)
+    edited_tokens = tokenize(edited_text)
+    diffs = difflib.ndiff(orig_tokens, edited_tokens)
+
+    deleted_tokens = [diff[2:] for diff in diffs if diff.startswith('- ')]
+
+    deleted_segment_ids = set()
+    for token in deleted_tokens:
+        if '[SILENCE-' in token:
+            match = re.search(r'\[SILENCE-(\d+)', token)
+            if match:
+                silence_id = int(match.group(1))
+                for i, seg in enumerate(transcript_segments):
+                    if seg.is_silence and seg.id == silence_id:
+                        deleted_segment_ids.add(i)
+                        break
+            continue
+
+        token = token.strip()
+        for i, seg in enumerate(transcript_segments):
+            if not seg.is_silence and seg.word.strip() == token:
+                deleted_segment_ids.add(i)
+                break
+
+        if token and all(i not in deleted_segment_ids for i, seg in enumerate(transcript_segments)
+                        if not seg.is_silence and seg.word.strip() == token):
+            clean_token = re.sub(r'[^\w\s]', '', token.lower())
+            if clean_token:
+                for i, seg in enumerate(transcript_segments):
+                    if seg.is_silence:
+                        continue
+                    if clean_token == re.sub(r'[^\w\s]', '', seg.word.lower()):
+                        deleted_segment_ids.add(i)
+                        break
+
+    return deleted_segment_ids
+
+
+def merge_into_cut_regions(deleted_segment_ids: Set[int],
+                           transcript_segments: list) -> List[CutRegion]:
+    """Merge deleted segment IDs into contiguous CutRegion objects."""
+    cut_segs = sorted([transcript_segments[i] for i in deleted_segment_ids], key=lambda s: s.start)
+    if not cut_segs:
+        return []
+    regions = []
+    start, end, text = cut_segs[0].start, cut_segs[0].end, cut_segs[0].word
+    for seg in cut_segs[1:]:
+        if seg.start <= end + 0.3:
+            end = max(end, seg.end)
+            text += " " + seg.word
+        else:
+            regions.append(CutRegion(start, end, text))
+            start, end, text = seg.start, seg.end, seg.word
+    regions.append(CutRegion(start, end, text))
+    return regions
+
+
+def compute_keep_segments(cut_regions: list, video_duration: float) -> list:
+    """Invert cut regions into a list of {'start', 'end'} segments to keep."""
+    segments = []
+    current = 0.0
+    for region in sorted(cut_regions, key=lambda x: x.start_time):
+        if region.start_time > current:
+            segments.append({'start': current, 'end': region.start_time})
+        current = region.end_time
+    if current < video_duration:
+        segments.append({'start': current, 'end': video_duration})
+    return segments
+
+
+def generate_edl_file(video_path: str, keep_segments: list, edl_path: str):
+    """Write an mpv EDL file that plays only the kept segments."""
+    abs_path = os.path.abspath(video_path)
+    with open(edl_path, 'w') as f:
+        f.write("# mpv EDL v0\n")
+        for seg in keep_segments:
+            f.write(f"{abs_path},{seg['start']},{seg['end'] - seg['start']}\n")
+
+
+def original_to_edl_time(timestamp: float, keep_segments: list) -> Optional[float]:
+    """Translate an original-video timestamp to EDL-timeline position."""
+    edl_offset = 0.0
+    for seg in keep_segments:
+        if seg['start'] <= timestamp <= seg['end']:
+            return edl_offset + (timestamp - seg['start'])
+        edl_offset += seg['end'] - seg['start']
+    return None
+
+
+def edl_to_original_time(edl_time: float, keep_segments: list) -> Optional[float]:
+    """Translate an EDL-timeline position back to original-video timestamp."""
+    edl_offset = 0.0
+    for seg in keep_segments:
+        seg_duration = seg['end'] - seg['start']
+        if edl_time <= edl_offset + seg_duration:
+            return seg['start'] + (edl_time - edl_offset)
+        edl_offset += seg_duration
+    return None
+
+
+# --- Preview classes ---
+
 class MpvPreviewController:
     """Controls an mpv instance via JSON IPC over a Unix socket"""
     def __init__(self, video_path: str, socket_path: str):
@@ -73,6 +191,7 @@ class MpvPreviewController:
         self.socket_path = socket_path
         self.process = None
         self._sock = None
+        self._lock = threading.Lock()
 
     def start(self):
         """Launch mpv paused with IPC socket"""
@@ -80,7 +199,8 @@ class MpvPreviewController:
             'mpv',
             '--input-ipc-server=' + self.socket_path,
             '--pause',
-            '--keep-open=yes',
+            '--keep-open=always',
+            '--idle=yes',
             '--no-terminal',
             '--force-window=yes',
             '--osd-level=1',
@@ -93,22 +213,61 @@ class MpvPreviewController:
             self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             self._sock.connect(self.socket_path)
 
+    def _send_command(self, command: list, request_id: int = 1):
+        """Send a command via IPC and return response data, or None on error."""
+        msg = json.dumps({"command": command, "request_id": request_id}) + "\n"
+        with self._lock:
+            try:
+                self._connect()
+                self._sock.sendall(msg.encode())
+                self._sock.settimeout(0.5)
+                buf = b""
+                while True:
+                    chunk = self._sock.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        if not line:
+                            continue
+                        try:
+                            resp = json.loads(line)
+                            if resp.get("request_id") == request_id:
+                                self._sock.settimeout(None)
+                                return resp
+                        except json.JSONDecodeError:
+                            pass
+            except (ConnectionRefusedError, FileNotFoundError, BrokenPipeError,
+                    OSError, socket.timeout):
+                self._sock = None
+            try:
+                if self._sock:
+                    self._sock.settimeout(None)
+            except OSError:
+                pass
+        return None
+
     def seek(self, timestamp: float):
         """Seek mpv to a timestamp in seconds"""
-        cmd = json.dumps({"command": ["seek", timestamp, "absolute"]}) + "\n"
-        try:
-            self._connect()
-            self._sock.sendall(cmd.encode())
-            # Drain response to avoid buffer buildup
-            self._sock.setblocking(False)
-            try:
-                self._sock.recv(4096)
-            except BlockingIOError:
-                pass
-            self._sock.setblocking(True)
-        except (ConnectionRefusedError, FileNotFoundError, BrokenPipeError, OSError):
-            # Socket not ready or connection lost — reconnect next time
-            self._sock = None
+        self._send_command(["seek", str(timestamp), "absolute"], request_id=0)
+
+    def get_property(self, name: str):
+        """Get an mpv property value. Returns None on error."""
+        resp = self._send_command(["get_property", name])
+        if resp and resp.get("error") == "success":
+            return resp.get("data")
+        return None
+
+    def is_paused(self) -> Optional[bool]:
+        return self.get_property("pause")
+
+    def get_time_pos(self) -> Optional[float]:
+        return self.get_property("time-pos")
+
+    def load_file(self, path: str, mode: str = "replace"):
+        """Load a file (or EDL) into mpv."""
+        self._send_command(["loadfile", path, mode], request_id=2)
 
     def stop(self):
         """Terminate mpv and clean up"""
@@ -140,38 +299,180 @@ class CursorWatcher(threading.Thread):
         self.poll_interval = poll_interval
         self.running = True
         self._last_timestamp = None
+        self.follower = None       # PlaybackFollower reference for coordination
+        self.save_watcher = None   # SaveWatcher reference for EDL time translation
 
     def run(self):
         while self.running:
+            # Suppress seeking while mpv is playing (PlaybackFollower drives)
+            if self.follower and self.follower.is_following:
+                time.sleep(self.poll_interval)
+                continue
             try:
                 with open(self.cursor_file, 'r') as f:
                     content = f.read().strip()
                 if content:
                     line, col = map(int, content.split(','))
                     ts = self._lookup(line, col)
-                    if ts is not None and (self._last_timestamp is None or abs(ts - self._last_timestamp) > 0.1):
-                        self.mpv.seek(ts)
-                        self._last_timestamp = ts
+                    if ts is not None:
+                        # Translate to EDL timeline if EDL is active
+                        seek_ts = ts
+                        if self.save_watcher and self.save_watcher.current_keep_segments is not None:
+                            edl_ts = original_to_edl_time(ts, self.save_watcher.current_keep_segments)
+                            if edl_ts is None:
+                                # Cursor is on a deleted segment, skip seeking
+                                time.sleep(self.poll_interval)
+                                continue
+                            seek_ts = edl_ts
+                        if self._last_timestamp is None or abs(seek_ts - self._last_timestamp) > 0.1:
+                            self.mpv.seek(seek_ts)
+                            self._last_timestamp = seek_ts
             except (FileNotFoundError, ValueError):
                 pass
             time.sleep(self.poll_interval)
 
     def _lookup(self, line: int, col: int) -> Optional[float]:
         """Find the timestamp for a given line and column (1-based, matching vim)"""
-        # Exact match: find segment on this line whose col range contains the cursor
         for entry in self.linecol_map:
             if entry['line'] == line and entry['col_start'] <= col <= entry['col_end']:
                 return entry['start_time']
-        # Fallback: closest segment on this line
         line_entries = [e for e in self.linecol_map if e['line'] == line]
         if line_entries:
             closest = min(line_entries, key=lambda e: abs(e['col_start'] - col))
             return closest['start_time']
-        # Fallback: nearest line
         if self.linecol_map:
             closest = min(self.linecol_map, key=lambda e: abs(e['line'] - line))
             return closest['start_time']
         return None
+
+    def stop(self):
+        self.running = False
+
+
+class PlaybackFollower(threading.Thread):
+    """When mpv is playing, writes target cursor position for vim to follow."""
+    def __init__(self, mpv: MpvPreviewController, linecol_map: list,
+                 target_file: str, poll_interval: float = 0.05):
+        super().__init__(daemon=True)
+        self.mpv = mpv
+        self.linecol_map = linecol_map
+        self.target_file = target_file
+        self.poll_interval = poll_interval
+        self.running = True
+        self.is_following = False
+        self.save_watcher = None  # SaveWatcher reference for EDL time translation
+
+    def run(self):
+        while self.running:
+            try:
+                paused = self.mpv.is_paused()
+                if paused is False:  # explicitly playing
+                    time_pos = self.mpv.get_time_pos()
+                    if time_pos is not None:
+                        # Translate from EDL time to original time if needed
+                        orig_time = time_pos
+                        if self.save_watcher and self.save_watcher.current_keep_segments is not None:
+                            orig_time = edl_to_original_time(time_pos, self.save_watcher.current_keep_segments)
+                            if orig_time is None:
+                                time.sleep(self.poll_interval)
+                                continue
+                        lc = self._timestamp_to_linecol(orig_time)
+                        if lc[0] is not None:
+                            with open(self.target_file, 'w') as f:
+                                f.write(f"{lc[0]},{lc[1]}")
+                            self.is_following = True
+                    time.sleep(self.poll_interval)
+                else:
+                    if self.is_following:
+                        try:
+                            os.unlink(self.target_file)
+                        except FileNotFoundError:
+                            pass
+                        self.is_following = False
+                    time.sleep(0.2)  # poll less when paused
+            except Exception:
+                time.sleep(self.poll_interval)
+
+    def _timestamp_to_linecol(self, timestamp: float) -> Tuple[Optional[int], Optional[int]]:
+        """Binary search linecol_map for entry with start_time <= timestamp."""
+        if not self.linecol_map:
+            return None, None
+        lo, hi = 0, len(self.linecol_map) - 1
+        best = 0
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if self.linecol_map[mid]['start_time'] <= timestamp:
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        entry = self.linecol_map[best]
+        return entry['line'], entry['col_start']
+
+    def stop(self):
+        self.running = False
+        try:
+            os.unlink(self.target_file)
+        except FileNotFoundError:
+            pass
+
+
+class SaveWatcher(threading.Thread):
+    """Watches for file saves and regenerates EDL for NLE preview."""
+    def __init__(self, signal_file: str, editor_file: str,
+                 original_content: str, transcript_segments: list,
+                 video_path: str, video_duration: float,
+                 edl_path: str, mpv: MpvPreviewController,
+                 poll_interval: float = 0.3):
+        super().__init__(daemon=True)
+        self.signal_file = signal_file
+        self.editor_file = editor_file
+        self.original_content = original_content
+        self.transcript_segments = transcript_segments
+        self.video_path = video_path
+        self.video_duration = video_duration
+        self.edl_path = edl_path
+        self.mpv = mpv
+        self.poll_interval = poll_interval
+        self.running = True
+        self.current_keep_segments = None  # None = raw video, list = EDL active
+
+    def run(self):
+        while self.running:
+            try:
+                if os.path.exists(self.signal_file):
+                    os.unlink(self.signal_file)
+                    self._on_save()
+            except Exception:
+                pass
+            time.sleep(self.poll_interval)
+
+    def _on_save(self):
+        """Regenerate EDL from current editor state."""
+        try:
+            with open(self.editor_file, 'r') as f:
+                edited_content = f.read()
+        except FileNotFoundError:
+            return
+
+        deleted_ids = compute_deleted_segment_ids(
+            self.original_content, edited_content, self.transcript_segments)
+
+        if not deleted_ids:
+            if self.current_keep_segments is not None:
+                self.mpv.load_file(str(self.video_path))
+                self.current_keep_segments = None
+            return
+
+        cut_regions = merge_into_cut_regions(deleted_ids, self.transcript_segments)
+        keep_segments = compute_keep_segments(cut_regions, self.video_duration)
+
+        if not keep_segments:
+            return
+
+        generate_edl_file(str(self.video_path), keep_segments, self.edl_path)
+        self.mpv.load_file(self.edl_path)
+        self.current_keep_segments = keep_segments
 
     def stop(self):
         self.running = False
@@ -461,16 +762,41 @@ class WizardCutEditor:
         with open(linecol_path, 'w') as f:
             json.dump(self.linecol_map, f, indent=2)
     
-    def _generate_vim_preview_script(self, cursor_file: str) -> Path:
-        """Generate a Vim/Neovim script that reports cursor position on every move"""
+    def _generate_vim_preview_script(self, cursor_file: str, target_file: str, save_signal: str) -> Path:
+        """Generate a Vim/Neovim script for bidirectional sync and save detection"""
         script_path = self.session_dir / "wizcut_preview.vim"
         with open(script_path, 'w') as f:
             f.write('" WizardCut live preview — auto-generated\n')
             f.write(f"let s:cursor_file = '{cursor_file}'\n")
+            f.write(f"let s:target_file = '{target_file}'\n")
+            f.write(f"let s:save_signal = '{save_signal}'\n")
+            f.write("let s:following_playback = 0\n\n")
+            # Cursor reporting (suppressed during playback follow)
             f.write("augroup WizardCutPreview\n")
             f.write("  autocmd!\n")
-            f.write("  autocmd CursorMoved,CursorMovedI * call writefile([line('.') . ',' . col('.')], s:cursor_file)\n")
-            f.write("augroup END\n")
+            f.write("  autocmd CursorMoved,CursorMovedI * if !s:following_playback | call writefile([line('.') . ',' . col('.')], s:cursor_file) | endif\n")
+            f.write("  autocmd BufWritePost <buffer> call writefile(['1'], s:save_signal)\n")
+            f.write("augroup END\n\n")
+            # Timer: follow mpv playback position
+            f.write("function! s:CheckPlaybackTarget(timer_id)\n")
+            f.write("  if !filereadable(s:target_file)\n")
+            f.write("    let s:following_playback = 0\n")
+            f.write("    return\n")
+            f.write("  endif\n")
+            f.write("  let l:content = readfile(s:target_file)\n")
+            f.write("  if empty(l:content) || l:content[0] == ''\n")
+            f.write("    return\n")
+            f.write("  endif\n")
+            f.write("  let l:parts = split(l:content[0], ',')\n")
+            f.write("  if len(l:parts) < 2\n")
+            f.write("    return\n")
+            f.write("  endif\n")
+            f.write("  let s:following_playback = 1\n")
+            f.write("  call cursor(str2nr(l:parts[0]), str2nr(l:parts[1]))\n")
+            f.write("  call timer_start(50, {-> execute('let s:following_playback = 0')})\n")
+            f.write("endfunction\n\n")
+            f.write("let s:playback_timer = timer_start(50, function('s:CheckPlaybackTarget'), {'repeat': -1})\n")
+            f.write("autocmd VimLeave * call timer_stop(s:playback_timer)\n")
         return script_path
 
     def open_in_editor(self) -> bool:
@@ -493,40 +819,63 @@ class WizardCutEditor:
             return False
 
     def _open_with_preview(self, editor: str) -> bool:
-        """Open editor with live mpv preview synced to cursor position"""
-        # Check mpv is available
+        """Open editor with bidirectional mpv preview and NLE playback"""
         if not shutil.which('mpv'):
             console.print("[red]Error: mpv not found. Install mpv for live preview.[/red]")
             return False
 
         cursor_file = f"/tmp/wizcut_{self.session_id}_cursor"
+        target_file = f"/tmp/wizcut_{self.session_id}_target"
+        save_signal = f"/tmp/wizcut_{self.session_id}_save_signal"
         mpv_socket = f"/tmp/wizcut_{self.session_id}_mpv.sock"
+        edl_path = str(self.session_dir / "preview.edl")
 
         # Start mpv
         mpv = MpvPreviewController(self.video_path, mpv_socket)
         mpv.start()
         console.print("[green]mpv preview window opened (paused)[/green]")
 
-        # Wait for mpv socket to be ready
+        # Wait for mpv socket
         for _ in range(20):
             if os.path.exists(mpv_socket):
                 break
             time.sleep(0.1)
 
-        # Start cursor watcher
+        # Get video duration for EDL generation
+        video_duration = self.get_video_duration()
+
+        # Start all threads
         watcher = CursorWatcher(cursor_file, self.linecol_map, mpv)
+        follower = PlaybackFollower(mpv, self.linecol_map, target_file)
+        save_watch = SaveWatcher(
+            signal_file=save_signal,
+            editor_file=str(self.editor_file),
+            original_content=self.original_content,
+            transcript_segments=self.transcript_segments,
+            video_path=str(self.video_path),
+            video_duration=video_duration,
+            edl_path=edl_path,
+            mpv=mpv,
+        )
+
+        # Wire cross-references
+        watcher.follower = follower
+        watcher.save_watcher = save_watch
+        follower.save_watcher = save_watch
+
         watcher.start()
+        follower.start()
+        save_watch.start()
 
         try:
-            # Detect vim/nvim for cursor reporting
             editor_base = os.path.basename(editor)
             if 'vim' in editor_base or 'nvim' in editor_base:
-                vim_script = self._generate_vim_preview_script(cursor_file)
+                vim_script = self._generate_vim_preview_script(cursor_file, target_file, save_signal)
                 cmd = [editor, '-S', str(vim_script), str(self.editor_file)]
-                console.print("[green]Live preview: cursor position syncs to video timestamp[/green]")
+                console.print("[green]Live preview: cursor syncs both ways. Save (:w) to update NLE preview.[/green]")
             else:
                 cmd = [editor, str(self.editor_file)]
-                console.print(f"[yellow]Warning: Live cursor sync requires vim or nvim. mpv is open but won't auto-seek.[/yellow]")
+                console.print("[yellow]Warning: Full sync requires vim or nvim. mpv open but limited.[/yellow]")
 
             subprocess.run(cmd, check=True)
             return True
@@ -535,156 +884,44 @@ class WizardCutEditor:
             return False
         finally:
             watcher.stop()
+            follower.stop()
+            save_watch.stop()
             mpv.stop()
-            # Clean up cursor file
-            try:
-                os.unlink(cursor_file)
-            except FileNotFoundError:
-                pass
+            for f in [cursor_file, target_file, save_signal]:
+                try:
+                    os.unlink(f)
+                except FileNotFoundError:
+                    pass
     
     def detect_word_level_changes(self) -> Set[int]:
         """Detect deleted segments using word-level diffing"""
-        # Read the edited content
         with open(self.editor_file, 'r') as f:
             edited_content = f.read()
-        
-        # Remove comment lines from both versions for comparison
-        orig_lines = [line for line in self.original_content.split('\n') if not line.startswith('#')]
-        edited_lines = [line for line in edited_content.split('\n') if not line.startswith('#')]
-        
-        # Combine into full text for word-level comparison
-        orig_text = '\n'.join(orig_lines)
-        edited_text = '\n'.join(edited_lines)
-        
-        # Split into words for diffing
-        # We need to preserve punctuation and special markers like [SILENCE]
-        def tokenize(text):
-            # Split by spaces but keep silence markers and punctuation intact
-            silence_pattern = r'(\[SILENCE-\d+ \d+\.\d+s\])'
-            # First, protect silence markers by replacing spaces within them
-            protected = re.sub(silence_pattern, lambda m: m.group(0).replace(' ', '█'), text)
-            # Split by whitespace
-            tokens = re.split(r'\s+', protected)
-            # Restore original silence markers
-            tokens = [t.replace('█', ' ') for t in tokens if t]
-            return tokens
-        
-        orig_tokens = tokenize(orig_text)
-        edited_tokens = tokenize(edited_text)
-        
-        # Use difflib to get the differences
-        diffs = difflib.ndiff(orig_tokens, edited_tokens)
-        
-        # Collect deletions
-        deleted_tokens = []
-        for diff in diffs:
-            if diff.startswith('- '):
-                deleted_tokens.append(diff[2:])
-        
-        # Find transcript segments corresponding to deleted tokens
-        deleted_segment_ids = set()
-        for token in deleted_tokens:
-            # Handle silence markers
-            if '[SILENCE-' in token:
-                try:
-                    # Extract silence ID from the marker
-                    match = re.search(r'\[SILENCE-(\d+)', token)
-                    if match:
-                        silence_id = int(match.group(1))
-                        # Find corresponding silence segment
-                        for i, segment in enumerate(self.transcript_segments):
-                            if segment.is_silence and segment.id == silence_id:
-                                deleted_segment_ids.add(i)
-                                break
-                except Exception as e:
-                    console.print(f"[yellow]Warning: Failed to parse silence marker '{token}': {e}[/yellow]")
-                continue
-            
-            # For regular words, find exact matches or close matches
-            token = token.strip()
-            for i, segment in enumerate(self.transcript_segments):
-                if segment.is_silence:
-                    continue
-                
-                if segment.word.strip() == token:
-                    deleted_segment_ids.add(i)
-                    break
-            
-            # If no exact match, try fuzzy matching for words with punctuation variations
-            if token and all(i not in deleted_segment_ids for i, segment in enumerate(self.transcript_segments) 
-                           if not segment.is_silence and segment.word.strip() == token):
-                clean_token = re.sub(r'[^\w\s]', '', token.lower())
-                if clean_token:  # Only proceed if we have something to match after cleaning
-                    for i, segment in enumerate(self.transcript_segments):
-                        if segment.is_silence:
-                            continue
-                        clean_segment = re.sub(r'[^\w\s]', '', segment.word.lower())
-                        if clean_token == clean_segment:
-                            deleted_segment_ids.add(i)
-                            break
-        
-        return deleted_segment_ids
+        return compute_deleted_segment_ids(
+            self.original_content, edited_content, self.transcript_segments)
     
     def find_segments_to_cut(self) -> bool:
         """Identify segments to cut based on editor deletions"""
-        # Use word-level diffing to detect deleted segments
         deleted_segment_ids = self.detect_word_level_changes()
-        
+
         if not deleted_segment_ids:
             console.print("[yellow]No content was deleted. No changes will be made to the video.[/yellow]")
             return False
-        
-        # Mark deleted segments
+
         for idx in deleted_segment_ids:
             self.transcript_segments[idx].deleted = True
-        
-        # Display all found deleted content for debugging
+
         console.print(f"\n[bold]Detected {len(deleted_segment_ids)} deleted segments:[/bold]")
         for idx in sorted(deleted_segment_ids):
             segment = self.transcript_segments[idx]
             console.print(f"  - {format_time(segment.start)}: '{segment.word}'")
-        
-        # Process deleted segments into cut regions
-        cut_segments = [self.transcript_segments[idx] for idx in sorted(deleted_segment_ids)]
-        
-        # Merge adjacent segments into cut regions
-        if cut_segments:
-            cut_segments.sort(key=lambda s: s.start)
-            
-            current_region_start = cut_segments[0].start
-            current_region_end = cut_segments[0].end
-            current_region_text = cut_segments[0].word
-            
-            for i in range(1, len(cut_segments)):
-                # If this segment is adjacent or close to previous (within 0.3 seconds)
-                if cut_segments[i].start <= current_region_end + 0.3:
-                    # Extend the current region
-                    current_region_end = max(current_region_end, cut_segments[i].end)
-                    current_region_text += " " + cut_segments[i].word
-                else:
-                    # Create a new cut region
-                    self.cut_regions.append(CutRegion(
-                        current_region_start,
-                        current_region_end,
-                        current_region_text
-                    ))
-                    # Start a new region
-                    current_region_start = cut_segments[i].start
-                    current_region_end = cut_segments[i].end
-                    current_region_text = cut_segments[i].word
-            
-            # Add the last region
-            self.cut_regions.append(CutRegion(
-                current_region_start,
-                current_region_end,
-                current_region_text
-            ))
-            
-            # Display the identified cut regions
+
+        self.cut_regions = merge_into_cut_regions(deleted_segment_ids, self.transcript_segments)
+
+        if self.cut_regions:
             console.print(f"\n[green]Found {len(self.cut_regions)} regions to cut:[/green]")
             for i, region in enumerate(self.cut_regions, 1):
                 console.print(f"  {i}. {region}")
-            
             return True
         else:
             console.print("[yellow]Could not identify specific regions to cut. No changes will be made.[/yellow]")
@@ -717,30 +954,8 @@ class WizardCutEditor:
             output_path = os.path.join(os.getcwd(), output_filename)
         
         # Create a list of segments to keep (inverse of what to cut)
-        segments_to_keep = []
-        current_start = 0
-        
-        # Sort cut regions by start time to process in order
-        sorted_regions = sorted(self.cut_regions, key=lambda x: x.start_time)
-        
-        for region in sorted_regions:
-            # Keep segment from current_start to region start
-            if region.start_time > current_start:
-                segments_to_keep.append({
-                    'start': current_start,
-                    'end': region.start_time
-                })
-            
-            # Update current_start to after this region
-            current_start = region.end_time
-        
-        # Add final segment if needed
         video_duration = self.get_video_duration()
-        if current_start < video_duration:
-            segments_to_keep.append({
-                'start': current_start,
-                'end': video_duration
-            })
+        segments_to_keep = compute_keep_segments(self.cut_regions, video_duration)
         
         # Create temporary file for filter complex script
         filter_file = self.session_dir / "filter_complex.txt"
