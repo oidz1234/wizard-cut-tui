@@ -865,14 +865,17 @@ class WizardCutEditor:
             for key in ['i', 'I', 'a', 'A', 'o', 'O', 'R', 's', 'S', 'c', 'C']:
                 f.write(f"nnoremap <buffer> {key} :echo 'Insert disabled — only delete text to cut video'<CR>\n")
             f.write("\n")
-            # Play/pause with Space
-            f.write("nnoremap <buffer> <Space> :call writefile(['toggle_pause'], s:cmd_file)<CR>\n\n")
+            # Play/pause with F5 (wrapped in function so s: vars are accessible)
+            f.write("function! s:TogglePause()\n")
+            f.write("  call writefile(['toggle_pause'], s:cmd_file)\n")
+            f.write("endfunction\n")
+            f.write("nnoremap <buffer> <F5> :call <SID>TogglePause()<CR>\n\n")
             # Help popup
             f.write("function! s:ShowHelp()\n")
             f.write("  call popup_create([\n")
             f.write("    \\ '  WizardCut Controls  ',\n")
             f.write("    \\ '  ------------------- ',\n")
-            f.write("    \\ '  Space   Play/Pause  ',\n")
+            f.write("    \\ '  F5      Play/Pause  ',\n")
             f.write("    \\ '  Cursor  Seek video  ',\n")
             f.write("    \\ '  dd/dw   Delete text  ',\n")
             f.write("    \\ '  :w      Update preview',\n")
