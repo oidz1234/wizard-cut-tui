@@ -1,60 +1,56 @@
 # WizardCut TUI
 
-A simple terminal-based video editor that lets you cut parts of videos by deleting text.
+Edit videos by deleting text. Whisper transcribes your video, you delete what you don't want, FFmpeg cuts it out.
+
+## Requirements
+
+- Python 3
+- FFmpeg
+- mpv (for live preview)
+- vim or neovim
 
 ## Installation
 
-
-1. Install the required packages:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-2. Make sure FFmpeg is installed on your system:
+```bash
+pip install openai-whisper rich
+```
 
 ## Usage
 
-### Basic usage:
 ```bash
-python wiz.py
-```
-This will prompt you to enter a video file path or drag and drop a file.
-
-### Specify input file:
-```bash
+# Basic - transcribe, edit, cut
 python wiz.py -f video.mp4
-```
 
-### Specify output location:
-```bash
-python wiz.py -f video.mp4 -o output.mp4
-```
-
-### Use a different Whisper model:
-```bash
-# Faster but less accurate
+# Use a faster/smaller model
 python wiz.py -f video.mp4 -m tiny
 
-# More accurate but slower
-python wiz.py -f video.mp4 -m large
+# Specify output path
+python wiz.py -f video.mp4 -o output.mp4
+
+# Disable live preview
+python wiz.py -f video.mp4 --no-preview
 ```
 
 ## How it works
 
-1. The script transcribes your video using Whisper
-2. The transcript opens in your default text editor (or vim)
-3. Delete any words or sentences you want to remove from the video
-4. Save and exit the editor
-5. The script processes the video, cutting out the parts you deleted
-6. The edited video is saved in your current directory
+1. Whisper transcribes your video with word-level timestamps
+2. The transcript opens in vim/nvim
+3. Delete any words, sentences, or silence markers you want to remove
+4. Save and quit - the video is processed with the cuts applied
+
+## Live Preview
+
+Preview is enabled by default when mpv and vim/nvim are available. An mpv window opens alongside your editor:
+
+- **Move your cursor** through the transcript - mpv seeks to that timestamp
+- **Press F5** to play/pause - the cursor follows playback in real-time
+- **Save (:w)** to update the preview - deleted segments are skipped during playback
+- **Press ?** for controls help
+
+Insert mode is disabled to prevent accidental text addition.
 
 ## Notes
 
-- By default, the edited video is saved to your current working directory
-- The script uses your $EDITOR environment variable, or falls back to vim
-- For best results, delete more on 1 line, not less, deleting just 1 word might
-  leave artifacts
-
-## TODO
-
-* Investigate crossfading for odd artifact removal
+- For best results, delete whole words or sentences rather than single characters
+- The default Whisper model is `medium` - use `tiny` for speed or `large` for accuracy
+- Edited video is saved to your current directory as `{name}_edited.{ext}`

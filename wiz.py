@@ -863,27 +863,35 @@ class WizardCutEditor:
             f.write("let s:following_playback = 0\n\n")
             # Disable insert mode — only deletions allowed
             for key in ['i', 'I', 'a', 'A', 'o', 'O', 'R', 's', 'S', 'c', 'C']:
-                f.write(f"nnoremap <buffer> {key} :echo 'Insert disabled — only delete text to cut video'<CR>\n")
+                f.write(f"nnoremap <buffer> {key} :echo 'Insert disabled - only delete text to cut video'<CR>\n")
             f.write("\n")
             # Play/pause with F5 (wrapped in function so s: vars are accessible)
             f.write("function! s:TogglePause()\n")
             f.write("  call writefile(['toggle_pause'], s:cmd_file)\n")
             f.write("endfunction\n")
             f.write("nnoremap <buffer> <F5> :call <SID>TogglePause()<CR>\n\n")
-            # Help popup
+            # Help popup (vim: popup_create, nvim: nvim_open_win)
             f.write("function! s:ShowHelp()\n")
-            f.write("  call popup_create([\n")
-            f.write("    \\ '  WizardCut Controls  ',\n")
-            f.write("    \\ '  ------------------- ',\n")
-            f.write("    \\ '  F5      Play/Pause  ',\n")
-            f.write("    \\ '  Cursor  Seek video  ',\n")
-            f.write("    \\ '  dd/dw   Delete text  ',\n")
-            f.write("    \\ '  :w      Update preview',\n")
-            f.write("    \\ '  :wq     Save & exit  ',\n")
-            f.write("    \\ '  u       Undo delete  ',\n")
-            f.write("    \\ '  ?       This help    ',\n")
-            f.write("    \\ ], {'border': [], 'padding': [0,1,0,1], 'pos': 'center', 'close': 'click',")
+            f.write("  let l:lines = ['  WizardCut Controls  ', '  ------------------- ',")
+            f.write(       " '  F5      Play/Pause  ', '  Cursor  Seek video  ',")
+            f.write(       " '  dd/dw   Delete text  ', '  :w      Update preview',")
+            f.write(       " '  :wq     Save & exit  ', '  u       Undo delete  ',")
+            f.write(       " '  ?       This help    ']\n")
+            f.write("  if has('nvim')\n")
+            f.write("    let l:buf = nvim_create_buf(v:false, v:true)\n")
+            f.write("    call nvim_buf_set_lines(l:buf, 0, -1, v:false, l:lines)\n")
+            f.write("    let l:opts = {'relative': 'editor', 'width': 26, 'height': len(l:lines),")
+            f.write(       " 'row': (&lines-len(l:lines))/2, 'col': (&columns-26)/2,")
+            f.write(       " 'style': 'minimal', 'border': 'rounded'}\n")
+            f.write("    let l:win = nvim_open_win(l:buf, v:true, l:opts)\n")
+            f.write("    nnoremap <buffer> <silent> <Esc> :close<CR>\n")
+            f.write("    nnoremap <buffer> <silent> ? :close<CR>\n")
+            f.write("    nnoremap <buffer> <silent> <CR> :close<CR>\n")
+            f.write("  else\n")
+            f.write("    call popup_create(l:lines, {'border': [], 'padding': [0,1,0,1],")
+            f.write(       " 'pos': 'center', 'close': 'click',")
             f.write(       " 'filter': {id, key -> popup_close(id)}})\n")
+            f.write("  endif\n")
             f.write("endfunction\n")
             f.write("nnoremap <buffer> ? :call <SID>ShowHelp()<CR>\n\n")
             # Cursor reporting (suppressed during playback follow)
@@ -1222,8 +1230,8 @@ def main():
     parser.add_argument("-o", "--output", help="Output path (file or directory)")
     parser.add_argument("-m", "--model", choices=["tiny", "base", "small", "medium", "large"], default="medium",
                        help="Whisper model size (default: medium)")
-    parser.add_argument("-p", "--preview", action="store_true",
-                       help="Enable live video preview with mpv (requires mpv and vim/nvim)")
+    parser.add_argument("--no-preview", action="store_true",
+                       help="Disable live video preview (preview requires mpv and vim/nvim)")
     args = parser.parse_args()
     
     try:
@@ -1237,7 +1245,7 @@ def main():
         if output_path:
             output_path = os.path.expanduser(output_path)
         
-        app = WizardCutEditor(output_path=output_path, preview=args.preview)
+        app = WizardCutEditor(output_path=output_path, preview=not args.no_preview)
         
         # Load and process the video
         if app.load_video(video_path):
