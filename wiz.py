@@ -265,6 +265,14 @@ class MpvPreviewController:
     def get_time_pos(self) -> Optional[float]:
         return self.get_property("time-pos")
 
+    def set_property(self, name: str, value):
+        """Set an mpv property."""
+        self._send_command(["set_property", name, value], request_id=3)
+
+    def send_command(self, cmd_list: list):
+        """Send a generic fire-and-forget command."""
+        self._send_command(cmd_list, request_id=4)
+
     def load_file(self, path: str, mode: str = "replace"):
         """Load a file (or EDL) into mpv."""
         self._send_command(["loadfile", path, mode], request_id=2)
@@ -473,6 +481,40 @@ class SaveWatcher(threading.Thread):
         generate_edl_file(str(self.video_path), keep_segments, self.edl_path)
         self.mpv.load_file(self.edl_path)
         self.current_keep_segments = keep_segments
+
+    def stop(self):
+        self.running = False
+
+
+class CommandDispatcher(threading.Thread):
+    """Reads commands from vim via a file and dispatches to mpv."""
+    def __init__(self, cmd_file: str, mpv: MpvPreviewController, poll_interval: float = 0.05):
+        super().__init__(daemon=True)
+        self.cmd_file = cmd_file
+        self.mpv = mpv
+        self.poll_interval = poll_interval
+        self.running = True
+
+    def run(self):
+        while self.running:
+            try:
+                if os.path.exists(self.cmd_file):
+                    with open(self.cmd_file, 'r') as f:
+                        cmd = f.read().strip()
+                    os.unlink(self.cmd_file)
+                    if cmd:
+                        self._dispatch(cmd)
+            except (FileNotFoundError, OSError):
+                pass
+            time.sleep(self.poll_interval)
+
+    def _dispatch(self, cmd: str):
+        if cmd == 'toggle_pause':
+            paused = self.mpv.is_paused()
+            if paused is not None:
+                self.mpv.set_property('pause', not paused)
+                label = "Paused" if not paused else "Playing"
+                self.mpv.send_command(["show-text", label, "1000"])
 
     def stop(self):
         self.running = False
@@ -762,7 +804,9 @@ class WizardCutEditor:
         with open(linecol_path, 'w') as f:
             json.dump(self.linecol_map, f, indent=2)
     
-    def _generate_vim_preview_script(self, cursor_file: str, target_file: str, save_signal: str) -> Path:
+    def _generate_vim_preview_script(self, cursor_file: str, target_file: str,
+                                      save_signal: str, cmd_file: str,
+                                      status_file: str) -> Path:
         """Generate a Vim/Neovim script for bidirectional sync and save detection"""
         script_path = self.session_dir / "wizcut_preview.vim"
         with open(script_path, 'w') as f:
@@ -770,7 +814,15 @@ class WizardCutEditor:
             f.write(f"let s:cursor_file = '{cursor_file}'\n")
             f.write(f"let s:target_file = '{target_file}'\n")
             f.write(f"let s:save_signal = '{save_signal}'\n")
+            f.write(f"let s:cmd_file = '{cmd_file}'\n")
+            f.write(f"let s:status_file = '{status_file}'\n")
             f.write("let s:following_playback = 0\n\n")
+            # Disable insert mode — only deletions allowed
+            for key in ['i', 'I', 'a', 'A', 'o', 'O', 'R', 's', 'S', 'c', 'C']:
+                f.write(f"nnoremap <buffer> {key} :echo 'Insert disabled — only delete text to cut video'<CR>\n")
+            f.write("\n")
+            # Play/pause with Space
+            f.write("nnoremap <buffer> <Space> :call writefile(['toggle_pause'], s:cmd_file)<CR>\n\n")
             # Cursor reporting (suppressed during playback follow)
             f.write("augroup WizardCutPreview\n")
             f.write("  autocmd!\n")
@@ -827,6 +879,8 @@ class WizardCutEditor:
         cursor_file = f"/tmp/wizcut_{self.session_id}_cursor"
         target_file = f"/tmp/wizcut_{self.session_id}_target"
         save_signal = f"/tmp/wizcut_{self.session_id}_save_signal"
+        cmd_file = f"/tmp/wizcut_{self.session_id}_cmd"
+        status_file = f"/tmp/wizcut_{self.session_id}_status"
         mpv_socket = f"/tmp/wizcut_{self.session_id}_mpv.sock"
         edl_path = str(self.session_dir / "preview.edl")
 
@@ -858,6 +912,8 @@ class WizardCutEditor:
             mpv=mpv,
         )
 
+        cmd_dispatch = CommandDispatcher(cmd_file, mpv)
+
         # Wire cross-references
         watcher.follower = follower
         watcher.save_watcher = save_watch
@@ -866,11 +922,12 @@ class WizardCutEditor:
         watcher.start()
         follower.start()
         save_watch.start()
+        cmd_dispatch.start()
 
         try:
             editor_base = os.path.basename(editor)
             if 'vim' in editor_base or 'nvim' in editor_base:
-                vim_script = self._generate_vim_preview_script(cursor_file, target_file, save_signal)
+                vim_script = self._generate_vim_preview_script(cursor_file, target_file, save_signal, cmd_file, status_file)
                 cmd = [editor, '-S', str(vim_script), str(self.editor_file)]
                 console.print("[green]Live preview: cursor syncs both ways. Save (:w) to update NLE preview.[/green]")
             else:
@@ -883,11 +940,12 @@ class WizardCutEditor:
             console.print(f"[red]Error opening editor: {e}[/red]")
             return False
         finally:
+            cmd_dispatch.stop()
             watcher.stop()
             follower.stop()
             save_watch.stop()
             mpv.stop()
-            for f in [cursor_file, target_file, save_signal]:
+            for f in [cursor_file, target_file, save_signal, cmd_file, status_file]:
                 try:
                     os.unlink(f)
                 except FileNotFoundError:
