@@ -7,7 +7,6 @@ and then processes the video by removing any parts you deleted in the editor.
 """
 
 import os
-import sys
 import json
 import uuid
 import tempfile
@@ -17,20 +16,81 @@ import time
 import argparse
 import difflib
 import re
+import shlex
 import socket
 import threading
 from pathlib import Path
-from typing import List, Dict, Any, Tuple, Optional, Set
+from typing import List, Tuple, Optional, Set
 
 try:
     import whisper
+except ImportError:
+    whisper = None
+
+try:
     from rich.console import Console
     from rich.panel import Panel
     from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
 except ImportError:
-    print("Required packages not found. Please install them with:")
-    print("pip install openai-whisper rich")
-    sys.exit(1)
+    class _PlainStatus:
+        def __init__(self, message: str):
+            self.message = _strip_rich_markup(message)
+
+        def __enter__(self):
+            print(self.message)
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class Console:
+        def print(self, *objects, **kwargs):
+            print(*(_strip_rich_markup(str(obj)) for obj in objects), **kwargs)
+
+        def status(self, message: str):
+            return _PlainStatus(message)
+
+    class Panel:
+        def __init__(self, renderable, subtitle=None):
+            self.renderable = renderable
+            self.subtitle = subtitle
+
+        def __str__(self):
+            if self.subtitle:
+                return f"{self.renderable}\n{self.subtitle}"
+            return str(self.renderable)
+
+    class _NoopProgressColumn:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    SpinnerColumn = BarColumn = TimeElapsedColumn = _NoopProgressColumn
+    TextColumn = _NoopProgressColumn
+
+    class Progress:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def add_task(self, *args, **kwargs):
+            return 0
+
+        def update(self, *args, **kwargs):
+            pass
+
+
+def _strip_rich_markup(text: str) -> str:
+    """Best-effort cleanup for fallback output when Rich is unavailable."""
+    return re.sub(
+        r"\[/?(?:bold|dim|red|green|yellow|blue|cyan|magenta|white|black)(?: [a-z]+)?\]",
+        "",
+        text,
+    )
 
 # Initialize rich console
 console = Console()
@@ -68,54 +128,50 @@ class CutRegion:
 
 # --- Standalone functions for reuse by preview threads ---
 
+SILENCE_TOKEN_RE = re.compile(r"\[SILENCE-(\d+)\s+[\d.]+s\]")
+
+
+def _tokenize_editable_content(content: str) -> List[str]:
+    """Tokenize transcript text while keeping silence markers as one token."""
+    lines = [line for line in content.splitlines() if not line.startswith('#')]
+    text = '\n'.join(lines)
+    protected = SILENCE_TOKEN_RE.sub(lambda m: m.group(0).replace(' ', '\0'), text)
+    return [token.replace('\0', ' ') for token in re.split(r'\s+', protected) if token]
+
+
+def _segment_token(segment: "TranscriptSegment") -> str:
+    return str(segment) if segment.is_silence else segment.word.strip()
+
+
+def _token_key(token: str) -> str:
+    token = token.strip()
+    match = SILENCE_TOKEN_RE.fullmatch(token)
+    if match:
+        return f"silence:{match.group(1)}"
+
+    normalized = re.sub(r"[^\w]+", "", token.lower())
+    return normalized or token.lower()
+
+
 def compute_deleted_segment_ids(original_content: str, edited_content: str,
                                 transcript_segments: list) -> Set[int]:
     """Diff original vs edited transcript content and return indices of deleted segments."""
-    orig_lines = [line for line in original_content.split('\n') if not line.startswith('#')]
-    edited_lines = [line for line in edited_content.split('\n') if not line.startswith('#')]
-    orig_text = '\n'.join(orig_lines)
-    edited_text = '\n'.join(edited_lines)
+    del original_content  # Segment order is the source of truth for original tokens.
 
-    def tokenize(text):
-        silence_pattern = r'(\[SILENCE-\d+ \d+\.\d+s\])'
-        protected = re.sub(silence_pattern, lambda m: m.group(0).replace(' ', '█'), text)
-        tokens = re.split(r'\s+', protected)
-        return [t.replace('█', ' ') for t in tokens if t]
+    original_records = []
+    for idx, segment in enumerate(transcript_segments):
+        token = _segment_token(segment)
+        if token:
+            original_records.append((_token_key(token), idx))
 
-    orig_tokens = tokenize(orig_text)
-    edited_tokens = tokenize(edited_text)
-    diffs = difflib.ndiff(orig_tokens, edited_tokens)
+    edited_keys = [_token_key(token) for token in _tokenize_editable_content(edited_content)]
+    original_keys = [key for key, _idx in original_records]
 
-    deleted_tokens = [diff[2:] for diff in diffs if diff.startswith('- ')]
-
+    matcher = difflib.SequenceMatcher(None, original_keys, edited_keys, autojunk=False)
     deleted_segment_ids = set()
-    for token in deleted_tokens:
-        if '[SILENCE-' in token:
-            match = re.search(r'\[SILENCE-(\d+)', token)
-            if match:
-                silence_id = int(match.group(1))
-                for i, seg in enumerate(transcript_segments):
-                    if seg.is_silence and seg.id == silence_id:
-                        deleted_segment_ids.add(i)
-                        break
-            continue
-
-        token = token.strip()
-        for i, seg in enumerate(transcript_segments):
-            if not seg.is_silence and seg.word.strip() == token:
-                deleted_segment_ids.add(i)
-                break
-
-        if token and all(i not in deleted_segment_ids for i, seg in enumerate(transcript_segments)
-                        if not seg.is_silence and seg.word.strip() == token):
-            clean_token = re.sub(r'[^\w\s]', '', token.lower())
-            if clean_token:
-                for i, seg in enumerate(transcript_segments):
-                    if seg.is_silence:
-                        continue
-                    if clean_token == re.sub(r'[^\w\s]', '', seg.word.lower()):
-                        deleted_segment_ids.add(i)
-                        break
+    for tag, start, end, _edited_start, _edited_end in matcher.get_opcodes():
+        if tag in {"delete", "replace"}:
+            deleted_segment_ids.update(idx for _key, idx in original_records[start:end])
 
     return deleted_segment_ids
 
@@ -143,10 +199,15 @@ def compute_keep_segments(cut_regions: list, video_duration: float) -> list:
     """Invert cut regions into a list of {'start', 'end'} segments to keep."""
     segments = []
     current = 0.0
+    video_duration = max(0.0, float(video_duration))
     for region in sorted(cut_regions, key=lambda x: x.start_time):
-        if region.start_time > current:
-            segments.append({'start': current, 'end': region.start_time})
-        current = region.end_time
+        start = min(max(0.0, region.start_time), video_duration)
+        end = min(max(0.0, region.end_time), video_duration)
+        if end <= start:
+            continue
+        if start > current:
+            segments.append({'start': current, 'end': start})
+        current = max(current, end)
     if current < video_duration:
         segments.append({'start': current, 'end': video_duration})
     return segments
@@ -444,6 +505,7 @@ class SaveWatcher(threading.Thread):
         self.poll_interval = poll_interval
         self.running = True
         self.current_keep_segments = None  # None = raw video, list = EDL active
+        self.current_cut_regions = []
 
     def run(self):
         while self.running:
@@ -470,12 +532,15 @@ class SaveWatcher(threading.Thread):
             if self.current_keep_segments is not None:
                 self.mpv.load_file(str(self.video_path))
                 self.current_keep_segments = None
+            self.current_cut_regions = []
             return
 
         cut_regions = merge_into_cut_regions(deleted_ids, self.transcript_segments)
         keep_segments = compute_keep_segments(cut_regions, self.video_duration)
+        self.current_cut_regions = cut_regions
 
         if not keep_segments:
+            self.current_keep_segments = []
             return
 
         generate_edl_file(str(self.video_path), keep_segments, self.edl_path)
@@ -510,9 +575,7 @@ class StatusUpdater(threading.Thread):
 
                 cuts = 0
                 if self.save_watcher and self.save_watcher.current_keep_segments is not None:
-                    # Number of gaps = number of cut regions
-                    ks = self.save_watcher.current_keep_segments
-                    cuts = max(0, len(ks) - 1) if ks else 0
+                    cuts = len(self.save_watcher.current_cut_regions)
 
                 with open(self.status_file, 'w') as f:
                     f.write(f"{state},{t},{d},{cuts}")
@@ -566,7 +629,8 @@ class CommandDispatcher(threading.Thread):
 
 class WizardCutEditor:
     """Main application class for WizardCut with system editor integration"""
-    def __init__(self, output_path=None, preview=False):
+    def __init__(self, output_path=None, preview=False, language=None,
+                 silence_threshold: float = 1.0):
         self.video_path = None
         self.audio_path = None
         self.transcript_path = None
@@ -581,6 +645,8 @@ class WizardCutEditor:
         self.original_content = None
         self.output_path = output_path  # Custom output path if specified
         self.preview = preview  # Enable live mpv preview
+        self.language = language
+        self.silence_threshold = silence_threshold
 
         # For tracking word positions in the editor
         self.word_index_map = {}  # Maps word positions in editor to transcript segments
@@ -589,14 +655,20 @@ class WizardCutEditor:
     
     def load_whisper_model(self, model_size: str = "medium") -> None:
         """Load the Whisper model"""
+        if whisper is None:
+            raise RuntimeError(
+                "openai-whisper is not installed. Install dependencies with: "
+                "pip install -r requirements.txt"
+            )
         with console.status(f"Loading Whisper {model_size} model..."):
             self.whisper_model = whisper.load_model(model_size)
             console.print(f"[green]Loaded Whisper {model_size} model[/green]")
     
     def load_video(self, video_path: str) -> bool:
         """Load a video file"""
-        if not os.path.exists(video_path):
-            console.print(f"[red]Error: File not found: {video_path}[/red]")
+        video_path = normalize_path(video_path)
+        if not os.path.isfile(video_path):
+            console.print(f"[red]Error: Video file not found: {video_path}[/red]")
             return False
         
         self.video_path = video_path
@@ -606,6 +678,10 @@ class WizardCutEditor:
     def extract_audio(self) -> bool:
         """Extract audio from video for transcription"""
         self.audio_path = self.session_dir / "audio.wav"
+
+        if not shutil.which('ffmpeg'):
+            console.print("[red]Error: ffmpeg not found. Install FFmpeg and try again.[/red]")
+            return False
         
         try:
             with console.status("Extracting audio from video..."):
@@ -618,17 +694,39 @@ class WizardCutEditor:
                 
             return True
         except subprocess.CalledProcessError as e:
-            console.print(f"[red]Error extracting audio: {e}[/red]")
+            stderr = e.stderr.decode() if isinstance(e.stderr, bytes) else e.stderr
+            console.print(f"[red]Error extracting audio: {stderr or e}[/red]")
             return False
     
     def get_video_duration(self) -> float:
         """Get video duration in seconds using FFprobe"""
+        if not shutil.which('ffprobe'):
+            raise RuntimeError("ffprobe not found. Install FFmpeg and try again.")
+
         result = subprocess.run([
             'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
             '-of', 'default=noprint_wrappers=1:nokey=1', str(self.video_path)
-        ], capture_output=True, text=True, check=True)
-        
-        return float(result.stdout.strip())
+        ], capture_output=True, text=True, check=False)
+
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "Could not read video duration.")
+
+        try:
+            return float(result.stdout.strip())
+        except ValueError as exc:
+            raise RuntimeError("Could not parse video duration from ffprobe output.") from exc
+
+    def has_audio_stream(self) -> bool:
+        """Return True when the loaded video has at least one audio stream."""
+        if not shutil.which('ffprobe'):
+            raise RuntimeError("ffprobe not found. Install FFmpeg and try again.")
+
+        result = subprocess.run([
+            'ffprobe', '-v', 'error', '-select_streams', 'a:0',
+            '-show_entries', 'stream=index',
+            '-of', 'csv=p=0', str(self.video_path)
+        ], capture_output=True, text=True, check=False)
+        return result.returncode == 0 and bool(result.stdout.strip())
     
     def transcribe_audio(self) -> bool:
         """Transcribe audio using Whisper"""
@@ -644,13 +742,13 @@ class WizardCutEditor:
                 result = self.whisper_model.transcribe(
                     str(self.audio_path),
                     word_timestamps=True,
-                    language="en"  # Can be modified or auto-detected
+                    language=self.language
                 )
                 
                 # Process words with timestamps and detect silence
                 self.transcript_segments = []
                 prev_end_time = 0
-                silence_threshold = 1.0  # Silence threshold in seconds
+                silence_threshold = self.silence_threshold
                 segment_id = 0  # Unique ID for each segment
                 
                 for segment in result["segments"]:
@@ -951,8 +1049,7 @@ class WizardCutEditor:
             if self.preview:
                 return self._open_with_preview(editor)
 
-            subprocess.run([editor, str(self.editor_file)], check=True)
-            return True
+            return self._open_plain_editor(editor)
         except subprocess.CalledProcessError as e:
             console.print(f"[red]Error opening editor: {e}[/red]")
             return False
@@ -960,11 +1057,25 @@ class WizardCutEditor:
             console.print(f"[red]Unexpected error: {e}[/red]")
             return False
 
+    def _open_plain_editor(self, editor: str) -> bool:
+        """Open the transcript without live preview."""
+        subprocess.run([editor, str(self.editor_file)], check=True)
+        return True
+
     def _open_with_preview(self, editor: str) -> bool:
         """Open editor with bidirectional mpv preview and NLE playback"""
         if not shutil.which('mpv'):
-            console.print("[red]Error: mpv not found. Install mpv for live preview.[/red]")
+            console.print("[yellow]mpv not found; opening editor without live preview.[/yellow]")
+            return self._open_plain_editor(editor)
+
+        try:
+            video_duration = self.get_video_duration()
+        except subprocess.CalledProcessError as e:
+            console.print(f"[red]Error opening editor: {e}[/red]")
             return False
+        except Exception as e:
+            console.print(f"[yellow]Could not start preview ({e}); opening editor without live preview.[/yellow]")
+            return self._open_plain_editor(editor)
 
         cursor_file = f"/tmp/wizcut_{self.session_id}_cursor"
         target_file = f"/tmp/wizcut_{self.session_id}_target"
@@ -980,13 +1091,16 @@ class WizardCutEditor:
         console.print("[green]mpv preview window opened (paused)[/green]")
 
         # Wait for mpv socket
+        socket_ready = False
         for _ in range(20):
             if os.path.exists(mpv_socket):
+                socket_ready = True
                 break
             time.sleep(0.1)
-
-        # Get video duration for EDL generation
-        video_duration = self.get_video_duration()
+        if not socket_ready:
+            mpv.stop()
+            console.print("[yellow]mpv preview did not start; opening editor without live preview.[/yellow]")
+            return self._open_plain_editor(editor)
 
         # Start all threads
         watcher = CursorWatcher(cursor_file, self.linecol_map, mpv)
@@ -1077,6 +1191,26 @@ class WizardCutEditor:
         else:
             console.print("[yellow]Could not identify specific regions to cut. No changes will be made.[/yellow]")
             return False
+
+    def _resolve_output_path(self) -> str:
+        """Resolve the output path and avoid overwriting the input video."""
+        input_path = Path(self.video_path).resolve()
+        filename_without_ext = input_path.stem
+        ext = input_path.suffix
+
+        if self.output_path:
+            output_path = Path(normalize_path(self.output_path))
+            if output_path.is_dir():
+                output_path = output_path / f"{filename_without_ext}_edited{ext}"
+        else:
+            output_path = Path.cwd() / f"{filename_without_ext}_edited{ext}"
+
+        output_path = output_path.resolve()
+        if output_path == input_path:
+            raise ValueError("Output path matches the input video. Choose a different output path.")
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        return str(output_path)
     
     def process_video(self) -> None:
         """Process the video to remove cut regions"""
@@ -1085,46 +1219,35 @@ class WizardCutEditor:
             return
         
         console.print(Panel("[bold blue]Processing Video[/bold blue]"))
-        
-        # Determine output path
-        if self.output_path:
-            # Custom output path was specified
-            output_path = self.output_path
-            
-            # If it's a directory, append the filename
-            if os.path.isdir(self.output_path):
-                input_filename = os.path.basename(self.video_path)
-                filename_without_ext, ext = os.path.splitext(input_filename)
-                output_filename = f"{filename_without_ext}_edited{ext}"
-                output_path = os.path.join(self.output_path, output_filename)
-        else:
-            # Default: current working directory with "_edited" suffix
-            input_filename = os.path.basename(self.video_path)
-            filename_without_ext, ext = os.path.splitext(input_filename)
-            output_filename = f"{filename_without_ext}_edited{ext}"
-            output_path = os.path.join(os.getcwd(), output_filename)
-        
-        # Create a list of segments to keep (inverse of what to cut)
-        video_duration = self.get_video_duration()
+
+        try:
+            output_path = self._resolve_output_path()
+            video_duration = self.get_video_duration()
+            has_audio = self.has_audio_stream()
+        except (OSError, RuntimeError, ValueError) as e:
+            console.print(f"[red]Error preparing video output: {e}[/red]")
+            return
+
         segments_to_keep = compute_keep_segments(self.cut_regions, video_duration)
+        if not segments_to_keep:
+            console.print("[red]Error: No segments to keep - entire video would be cut[/red]")
+            return
         
         # Create temporary file for filter complex script
         filter_file = self.session_dir / "filter_complex.txt"
         with open(filter_file, 'w') as f:
             for i, segment in enumerate(segments_to_keep):
                 f.write(f"[0:v]trim={segment['start']}:{segment['end']},setpts=PTS-STARTPTS[v{i}];\n")
-                f.write(f"[0:a]atrim={segment['start']}:{segment['end']},asetpts=PTS-STARTPTS[a{i}];\n")
+                if has_audio:
+                    f.write(f"[0:a]atrim={segment['start']}:{segment['end']},asetpts=PTS-STARTPTS[a{i}];\n")
             
             # Concatenate video and audio streams
             v_stream = ''.join(f'[v{i}]' for i in range(len(segments_to_keep)))
-            a_stream = ''.join(f'[a{i}]' for i in range(len(segments_to_keep)))
-            
-            if segments_to_keep:
-                f.write(f"{v_stream}concat=n={len(segments_to_keep)}:v=1:a=0[outv];\n")
+            f.write(f"{v_stream}concat=n={len(segments_to_keep)}:v=1:a=0[outv]")
+            if has_audio:
+                a_stream = ''.join(f'[a{i}]' for i in range(len(segments_to_keep)))
+                f.write(";\n")
                 f.write(f"{a_stream}concat=n={len(segments_to_keep)}:v=0:a=1[outa]")
-            else:
-                console.print("[red]Error: No segments to keep - entire video would be cut[/red]")
-                return
         
         # Run FFmpeg for full quality edit
         with Progress(
@@ -1138,12 +1261,16 @@ class WizardCutEditor:
             try:
                 # Build the FFmpeg command
                 ffmpeg_cmd = [
-                    'ffmpeg', '-y', '-i', str(self.video_path), 
+                    'ffmpeg', '-y', '-hide_banner', '-i', str(self.video_path),
                     '-filter_complex_script', str(filter_file),
-                    '-map', '[outv]', '-map', '[outa]',
+                    '-map', '[outv]',
                     '-c:v', 'libx264', '-preset', 'medium',
-                    '-c:a', 'aac', output_path
                 ]
+                if has_audio:
+                    ffmpeg_cmd.extend(['-map', '[outa]', '-c:a', 'aac'])
+                else:
+                    ffmpeg_cmd.append('-an')
+                ffmpeg_cmd.extend(['-movflags', '+faststart', output_path])
                 
                 # Run FFmpeg
                 process = subprocess.Popen(
@@ -1153,10 +1280,13 @@ class WizardCutEditor:
                     universal_newlines=True
                 )
                 
-                # Update progress
-                while process.poll() is None:
-                    progress.update(task, advance=0.5)
-                    time.sleep(0.1)
+                stderr = ""
+                while True:
+                    try:
+                        _stdout, stderr = process.communicate(timeout=0.2)
+                        break
+                    except subprocess.TimeoutExpired:
+                        progress.update(task, advance=0.5)
                 
                 # Process completed
                 progress.update(task, completed=100)
@@ -1167,14 +1297,14 @@ class WizardCutEditor:
                     console.print(f"\nOutput saved to: [bold]{output_path}[/bold]")
                     
                     # Calculate how much was cut
-                    original_duration = self.get_video_duration()
-                    saved_time = sum(r.end_time - r.start_time for r in self.cut_regions)
-                    console.print(f"\nOriginal duration: {format_time(original_duration)}")
-                    console.print(f"Time removed: {format_time(saved_time)} ({saved_time/original_duration*100:.1f}%)")
-                    console.print(f"New duration: {format_time(original_duration - saved_time)}")
+                    kept_time = sum(seg['end'] - seg['start'] for seg in segments_to_keep)
+                    saved_time = max(0.0, video_duration - kept_time)
+                    percent = (saved_time / video_duration * 100) if video_duration else 0.0
+                    console.print(f"\nOriginal duration: {format_time(video_duration)}")
+                    console.print(f"Time removed: {format_time(saved_time)} ({percent:.1f}%)")
+                    console.print(f"New duration: {format_time(kept_time)}")
                 else:
-                    stderr = process.stderr.read()
-                    console.print(f"\n[red]Error processing video: {stderr}[/red]")
+                    console.print(f"\n[red]Error processing video: {stderr.strip()}[/red]")
             
             except Exception as e:
                 console.print(f"\n[red]Error processing video: {e}[/red]")
@@ -1203,10 +1333,30 @@ class WizardCutEditor:
             console.print("[yellow]No changes detected. The video will not be modified.[/yellow]")
 
 def format_time(seconds: float) -> str:
-    """Format seconds as MM:SS"""
-    mins = int(seconds / 60)
-    secs = int(seconds % 60)
-    return f"{mins}:{secs:02d}"
+    """Format seconds as M:SS, preserving tenths when useful."""
+    seconds = max(0.0, float(seconds))
+    rounded_seconds = round(seconds)
+    if abs(seconds - rounded_seconds) < 0.05:
+        mins = int(rounded_seconds // 60)
+        secs = int(rounded_seconds % 60)
+        return f"{mins}:{secs:02d}"
+
+    mins = int(seconds // 60)
+    secs = seconds - mins * 60
+    return f"{mins}:{secs:04.1f}"
+
+
+def normalize_path(path: str) -> str:
+    """Normalize CLI or drag-and-drop paths, including shell-escaped spaces."""
+    path = path.strip()
+    try:
+        parts = shlex.split(path)
+        if len(parts) == 1:
+            path = parts[0]
+    except ValueError:
+        path = path.strip("'\"")
+    return os.path.abspath(os.path.expanduser(path))
+
 
 def get_video_path():
     """Get video file path with support for drag and drop"""
@@ -1218,10 +1368,7 @@ def get_video_path():
     path = input().strip()
     
     # Clean up the path (terminals often add quotes or escape characters when drag-dropping)
-    path = path.strip("'\"")  # Remove quotes
-    path = os.path.expanduser(path)  # Expand ~ to home directory
-    
-    return path
+    return normalize_path(path)
 
 def main():
     """Main entry point"""
@@ -1230,10 +1377,17 @@ def main():
     parser.add_argument("-o", "--output", help="Output path (file or directory)")
     parser.add_argument("-m", "--model", choices=["tiny", "base", "small", "medium", "large"], default="medium",
                        help="Whisper model size (default: medium)")
+    parser.add_argument("-l", "--language",
+                       help="Language code for Whisper, for example 'en'. Omit to auto-detect.")
+    parser.add_argument("--silence-threshold", type=float, default=1.0,
+                       help="Minimum silence duration in seconds to expose as a deletable marker (default: 1.0)")
     parser.add_argument("--no-preview", action="store_true",
                        help="Disable live video preview (preview requires mpv and vim/nvim)")
     args = parser.parse_args()
-    
+    if args.silence_threshold <= 0:
+        parser.error("--silence-threshold must be greater than 0")
+    app = None
+
     try:
         # Get video file path
         video_path = args.file
@@ -1243,9 +1397,14 @@ def main():
         # Prepare output path if specified
         output_path = args.output
         if output_path:
-            output_path = os.path.expanduser(output_path)
+            output_path = normalize_path(output_path)
         
-        app = WizardCutEditor(output_path=output_path, preview=not args.no_preview)
+        app = WizardCutEditor(
+            output_path=output_path,
+            preview=not args.no_preview,
+            language=args.language,
+            silence_threshold=args.silence_threshold,
+        )
         
         # Load and process the video
         if app.load_video(video_path):
@@ -1258,16 +1417,17 @@ def main():
                 if app.transcribe_audio():
                     # Run the main process
                     app.run()
-        
-        # Cleanup
-        app.cleanup()
-    
     except KeyboardInterrupt:
         console.print("\n[yellow]Program interrupted. Exiting...[/yellow]")
+    except RuntimeError as e:
+        console.print(f"\n[red]An error occurred: {e}[/red]")
     except Exception as e:
         console.print(f"\n[red]An error occurred: {e}[/red]")
         import traceback
         console.print(traceback.format_exc())
+    finally:
+        if app is not None:
+            app.cleanup()
     
     console.print("\n[bold blue]Thanks for using WizardCut![/bold blue]")
 

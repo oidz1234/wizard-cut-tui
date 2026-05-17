@@ -2,18 +2,20 @@
 
 Edit videos by deleting text. Whisper transcribes your video, you delete what you don't want, FFmpeg cuts it out.
 
-## Requirements
+## Installation
+
+```bash
+git clone https://github.com/oidz1234/wizard-cut-tui.git
+cd wizard-cut-tui
+pip install -r requirements.txt
+```
+
+### Requirements
 
 - Python 3
 - FFmpeg
 - mpv (for live preview)
 - vim or neovim
-
-## Installation
-
-```bash
-pip install openai-whisper rich
-```
 
 ## Usage
 
@@ -26,6 +28,12 @@ python wiz.py -f video.mp4 -m tiny
 
 # Specify output path
 python wiz.py -f video.mp4 -o output.mp4
+
+# Pin a language, or omit this flag to let Whisper auto-detect
+python wiz.py -f video.mp4 -l en
+
+# Show shorter silences as editable markers
+python wiz.py -f video.mp4 --silence-threshold 0.6
 
 # Disable live preview
 python wiz.py -f video.mp4 --no-preview
@@ -53,4 +61,5 @@ Insert mode is disabled to prevent accidental text addition.
 
 - For best results, delete whole words or sentences rather than single characters
 - The default Whisper model is `medium` - use `tiny` for speed or `large` for accuracy
+- If `mpv` cannot start, WizardCut falls back to the plain editor flow
 - Edited video is saved to your current directory as `{name}_edited.{ext}`
